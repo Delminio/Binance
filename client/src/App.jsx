@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { createChart, CandlestickSeries } from 'lightweight-charts';
+import { createChart, CandlestickSeries, LineSeries } from 'lightweight-charts';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 const DEFAULT_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'SPKUSDC'];
@@ -32,6 +32,31 @@ function getPriceFormat(symbol, latestPrice) {
   if (price > 0 && price < 1) return { precision: 6, minMove: 0.000001 };
   if (price > 0 && price < 100) return { precision: 4, minMove: 0.0001 };
   return { precision: 2, minMove: 0.01 };
+}
+
+function getReadablePriceRange(candles, symbol, latestPrice) {
+  if (!candles.length) return null;
+
+  const recent = candles.slice(-80);
+  const highs = recent.map((candle) => Number(candle.high)).filter(Number.isFinite);
+  const lows = recent.map((candle) => Number(candle.low)).filter(Number.isFinite);
+
+  if (!highs.length || !lows.length) return null;
+
+  const rawHigh = Math.max(...highs);
+  const rawLow = Math.min(...lows);
+  const middle = (rawHigh + rawLow) / 2;
+  const format = getPriceFormat(symbol, latestPrice || middle);
+
+  const currentRange = Math.max(rawHigh - rawLow, format.minMove);
+  const minimumRangeByTick = format.minMove * 90;
+  const minimumRangeByPrice = Math.abs(middle) * (middle < 1 ? 0.0012 : 0.0008);
+  const finalRange = Math.max(currentRange * 1.8, minimumRangeByTick, minimumRangeByPrice);
+
+  return {
+    minValue: middle - finalRange / 2,
+    maxValue: middle + finalRange / 2
+  };
 }
 
 function formatPrice(value, symbol) {
@@ -133,6 +158,8 @@ function CoinChartCard({ symbol, latestPrice, candles, onToggleFullscreen }) {
   const cardRef = useRef(null);
   const chartRef = useRef(null);
   const seriesRef = useRef(null);
+  const lineSeriesRef = useRef(null);
+  const candlesRef = useRef([]);
   const [barSpacing, setBarSpacing] = useState(14);
   const summary = useMemo(() => summarizeSymbol(symbol, candles), [symbol, candles]);
   const lastCandle = candles[candles.length - 1] || null;
@@ -176,6 +203,18 @@ function CoinChartCard({ symbol, latestPrice, candles, onToggleFullscreen }) {
       }
     });
 
+    const autoScaleForSmallMoves = (baseImplementation) => {
+      const baseResult = baseImplementation?.();
+      const readableRange = getReadablePriceRange(candlesRef.current, symbol, latestPrice);
+
+      if (!readableRange) return baseResult;
+
+      return {
+        ...baseResult,
+        priceRange: readableRange
+      };
+    };
+
     const series = chart.addSeries(CandlestickSeries, {
       upColor: '#21c77a',
       downColor: '#ff5b5b',
@@ -187,11 +226,26 @@ function CoinChartCard({ symbol, latestPrice, candles, onToggleFullscreen }) {
       priceFormat: {
         type: 'price',
         ...getPriceFormat(symbol, latestPrice)
-      }
+      },
+      autoscaleInfoProvider: autoScaleForSmallMoves
+    });
+
+    const lineSeries = chart.addSeries(LineSeries, {
+      color: '#2dff9f',
+      lineWidth: 2,
+      crosshairMarkerVisible: false,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      priceFormat: {
+        type: 'price',
+        ...getPriceFormat(symbol, latestPrice)
+      },
+      autoscaleInfoProvider: autoScaleForSmallMoves
     });
 
     chartRef.current = chart;
     seriesRef.current = series;
+    lineSeriesRef.current = lineSeries;
 
     const resize = () => {
       if (!chartContainerRef.current || !chartRef.current) return;
@@ -222,19 +276,29 @@ function CoinChartCard({ symbol, latestPrice, candles, onToggleFullscreen }) {
   useEffect(() => {
     if (!seriesRef.current || !chartRef.current) return;
 
-    seriesRef.current.applyOptions({
-      priceFormat: {
-        type: 'price',
-        ...getPriceFormat(symbol, latestPrice)
-      }
-    });
+    const priceFormat = {
+      type: 'price',
+      ...getPriceFormat(symbol, latestPrice)
+    };
+
+    seriesRef.current.applyOptions({ priceFormat });
+    lineSeriesRef.current?.applyOptions({ priceFormat });
   }, [latestPrice]);
 
   useEffect(() => {
     if (!seriesRef.current || !chartRef.current) return;
     if (!candles.length) return;
 
+    candlesRef.current = candles;
+
     seriesRef.current.setData(candles);
+    lineSeriesRef.current?.setData(
+      candles.map((candle) => ({
+        time: candle.time,
+        value: candle.close
+      }))
+    );
+
     chartRef.current.timeScale().fitContent();
   }, [candles]);
 
