@@ -88,6 +88,23 @@ function getTimeframe(value) {
   return TIMEFRAMES.find((item) => item.value === value) || TIMEFRAMES[0];
 }
 
+function readStoredJson(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredJson(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // noop
+  }
+}
+
 function bucketLiveCandles(candles, timeframeValue) {
   const tf = getTimeframe(timeframeValue);
   const map = new Map();
@@ -282,7 +299,127 @@ function TimeframeToolbar({ timeframe, onChange, onFit, onFullscreen, showMA, on
   );
 }
 
-function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen }) {
+function OrderbookPanel({ symbol, latestPrice, liveTrades }) {
+  const [orderbook, setOrderbook] = useState({ bids: [], asks: [] });
+  const [bookStatus, setBookStatus] = useState('Carregando book...');
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer;
+
+    async function loadBook() {
+      try {
+        const response = await fetch(`${API_URL}/orderbook/${symbol}?limit=50`);
+        const data = await response.json();
+        if (!response.ok || !data?.ok) throw new Error(data?.message || 'Orderbook indisponível');
+        if (!cancelled) {
+          setOrderbook(data.orderbook || { bids: [], asks: [] });
+          setBookStatus('Orderbook real atualizado');
+        }
+      } catch (error) {
+        if (!cancelled) setBookStatus(error.message || 'Orderbook indisponível');
+      } finally {
+        if (!cancelled) timer = setTimeout(loadBook, 2500);
+      }
+    }
+
+    loadBook();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [symbol]);
+
+  const asks = [...(orderbook.asks || [])].slice(0, 12).reverse();
+  const bids = (orderbook.bids || []).slice(0, 12);
+  const spread = asks.length && bids.length ? asks.at(-1).price - bids[0].price : null;
+  const spreadPercent = spread && latestPrice ? (spread / latestPrice) * 100 : null;
+  const maxTotal = Math.max(
+    1,
+    ...asks.map((level) => Number(level.total || 0)),
+    ...bids.map((level) => Number(level.total || 0))
+  );
+  const recentTrades = (liveTrades || []).slice(0, 18);
+  const buyVolume = recentTrades.filter((trade) => trade.side === 'buy').reduce((sum, trade) => sum + Number(trade.quantity || 0), 0);
+  const sellVolume = recentTrades.filter((trade) => trade.side === 'sell').reduce((sum, trade) => sum + Number(trade.quantity || 0), 0);
+  const totalTradeVolume = buyVolume + sellVolume || 1;
+  const buyPercent = (buyVolume / totalTradeVolume) * 100;
+  const sellPercent = (sellVolume / totalTradeVolume) * 100;
+
+  function renderLevel(level, side) {
+    const width = Math.min(100, (Number(level.total || 0) / maxTotal) * 100);
+    return (
+      <div key={`${side}-${level.price}`} className={`book-row ${side}`}>
+        <span className="book-bg" style={{ width: `${width}%` }} />
+        <b>{formatPrice(level.price, symbol)}</b>
+        <span>{formatCompact(level.quantity)}</span>
+        <span>{formatCompact(level.total)}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="microstructure-grid">
+      <section className="orderbook-panel terminal-panel">
+        <div className="panel-head">
+          <div>
+            <h4>Orderbook real</h4>
+            <p>{bookStatus}</p>
+          </div>
+          <span>{spread == null ? 'Spread -' : `Spread ${formatPrice(spread, symbol)} (${spreadPercent?.toFixed(3)}%)`}</span>
+        </div>
+        <div className="book-header"><span>Preço</span><span>Qtd.</span><span>Total</span></div>
+        <div className="book-list asks">{asks.map((level) => renderLevel(level, 'ask'))}</div>
+        <div className="mid-price">Último preço <strong>{formatPrice(latestPrice, symbol)}</strong></div>
+        <div className="book-list bids">{bids.map((level) => renderLevel(level, 'bid'))}</div>
+      </section>
+
+      <section className="trades-panel terminal-panel">
+        <div className="panel-head">
+          <div>
+            <h4>Trades ao vivo</h4>
+            <p>Últimas negociações recebidas por WebSocket.</p>
+          </div>
+          <span>{recentTrades.length} trades</span>
+        </div>
+        <div className="pressure-bar">
+          <span className="buy" style={{ width: `${buyPercent}%` }}>Buy {buyPercent.toFixed(0)}%</span>
+          <span className="sell" style={{ width: `${sellPercent}%` }}>Sell {sellPercent.toFixed(0)}%</span>
+        </div>
+        <div className="trade-header"><span>Preço</span><span>Qtd.</span><span>Lado</span></div>
+        <div className="trade-list">
+          {recentTrades.length ? recentTrades.map((trade) => (
+            <div key={`${trade.tradeId}-${trade.eventTime}`} className={`trade-row ${trade.side}`}>
+              <b>{formatPrice(trade.price, symbol)}</b>
+              <span>{formatCompact(trade.quantity)}</span>
+              <em>{trade.side === 'buy' ? 'Compra' : 'Venda'}</em>
+            </div>
+          )) : <p className="muted-row">Aguardando trades...</p>}
+        </div>
+      </section>
+
+      <section className="depth-panel terminal-panel">
+        <div className="panel-head">
+          <div>
+            <h4>DOM Depth</h4>
+            <p>Profundidade visual das maiores camadas de compra e venda.</p>
+          </div>
+        </div>
+        <div className="depth-bars">
+          {[...bids.slice(0, 10)].reverse().map((level) => (
+            <div key={`depth-bid-${level.price}`} className="depth-bar bid" style={{ height: `${Math.max(8, (level.total / maxTotal) * 120)}px` }} title={`Bid ${formatPrice(level.price, symbol)}`} />
+          ))}
+          {asks.slice(0, 10).map((level) => (
+            <div key={`depth-ask-${level.price}`} className="depth-bar ask" style={{ height: `${Math.max(8, (level.total / maxTotal) * 120)}px` }} title={`Ask ${formatPrice(level.price, symbol)}`} />
+          ))}
+        </div>
+        <div className="depth-caption"><span>Compras</span><span>Vendas</span></div>
+      </section>
+    </div>
+  );
+}
+
+function CoinChartCard({ symbol, latestPrice, liveCandles, liveTrades, onToggleFullscreen }) {
   const chartContainerRef = useRef(null);
   const cardRef = useRef(null);
   const chartRef = useRef(null);
@@ -291,11 +428,38 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
   const ma7Ref = useRef(null);
   const ma25Ref = useRef(null);
   const ma99Ref = useRef(null);
-  const [timeframe, setTimeframe] = useState('1s');
+  const [timeframe, setTimeframeState] = useState(() => readStoredJson(`crypto-timeframe-${symbol}`, '1s'));
   const [historicalCandles, setHistoricalCandles] = useState([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
-  const [showMA, setShowMA] = useState(true);
-  const [showVolume, setShowVolume] = useState(true);
+  const [showMA, setShowMA] = useState(() => readStoredJson(`crypto-show-ma-${symbol}`, true));
+  const [showVolume, setShowVolume] = useState(() => readStoredJson(`crypto-show-volume-${symbol}`, true));
+  const [showMicrostructure, setShowMicrostructure] = useState(() => readStoredJson(`crypto-show-micro-${symbol}`, true));
+
+  function setTimeframe(value) {
+    setTimeframeState(value);
+    writeStoredJson(`crypto-timeframe-${symbol}`, value);
+  }
+
+  function toggleMA() {
+    setShowMA((value) => {
+      writeStoredJson(`crypto-show-ma-${symbol}`, !value);
+      return !value;
+    });
+  }
+
+  function toggleVolume() {
+    setShowVolume((value) => {
+      writeStoredJson(`crypto-show-volume-${symbol}`, !value);
+      return !value;
+    });
+  }
+
+  function toggleMicrostructure() {
+    setShowMicrostructure((value) => {
+      writeStoredJson(`crypto-show-micro-${symbol}`, !value);
+      return !value;
+    });
+  }
 
   const displayCandles = useMemo(
     () => mergeHistoricalWithLive(historicalCandles, liveCandles, timeframe),
@@ -380,9 +544,7 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
           }
         }
 
-        if (!cancelled) {
-          setHistoricalCandles(candles);
-        }
+        if (!cancelled) setHistoricalCandles(candles);
       } catch (error) {
         console.warn(`Não foi possível carregar histórico de ${symbol} ${timeframe}:`, error.message);
         if (!cancelled) setHistoricalCandles([]);
@@ -392,9 +554,7 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
     }
 
     loadHistory();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [symbol, timeframe]);
 
   useEffect(() => {
@@ -415,10 +575,7 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
       },
       rightPriceScale: {
         borderColor: 'rgba(132,142,156,0.25)',
-        scaleMargins: {
-          top: 0.08,
-          bottom: showVolume ? 0.26 : 0.12
-        }
+        scaleMargins: { top: 0.08, bottom: showVolume ? 0.26 : 0.12 }
       },
       timeScale: {
         borderColor: 'rgba(132,142,156,0.25)',
@@ -447,10 +604,7 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
       priceLineColor: '#0ecb81',
       priceLineVisible: true,
       lastValueVisible: true,
-      priceFormat: {
-        type: 'price',
-        ...getPriceFormat(symbol, latestPrice)
-      }
+      priceFormat: { type: 'price', ...getPriceFormat(symbol, latestPrice) }
     });
 
     const volumeSeries = chart.addSeries(HistogramSeries, {
@@ -459,10 +613,7 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
       lastValueVisible: false,
       priceLineVisible: false
     });
-    chart.priceScale('volume').applyOptions({
-      scaleMargins: { top: 0.76, bottom: 0 },
-      borderVisible: false
-    });
+    chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.76, bottom: 0 }, borderVisible: false });
 
     const ma7 = chart.addSeries(LineSeries, { color: '#f0b90b', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
     const ma25 = chart.addSeries(LineSeries, { color: '#e843c4', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
@@ -477,10 +628,7 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
 
     const resize = () => {
       if (!chartContainerRef.current || !chartRef.current) return;
-      chartRef.current.applyOptions({
-        width: chartContainerRef.current.clientWidth,
-        height: CHART_HEIGHT
-      });
+      chartRef.current.applyOptions({ width: chartContainerRef.current.clientWidth, height: CHART_HEIGHT });
     };
 
     const resizeObserver = new ResizeObserver(resize);
@@ -498,21 +646,13 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
     if (!chartRef.current) return;
     chartRef.current.applyOptions({
       rightPriceScale: { scaleMargins: { top: 0.08, bottom: showVolume ? 0.26 : 0.12 } },
-      timeScale: {
-        secondsVisible: timeframe === '1s',
-        barSpacing: timeframe === '1s' ? 7 : 9
-      }
+      timeScale: { secondsVisible: timeframe === '1s', barSpacing: timeframe === '1s' ? 7 : 9 }
     });
   }, [timeframe, showVolume]);
 
   useEffect(() => {
     if (!candleSeriesRef.current) return;
-    candleSeriesRef.current.applyOptions({
-      priceFormat: {
-        type: 'price',
-        ...getPriceFormat(symbol, latestPrice)
-      }
-    });
+    candleSeriesRef.current.applyOptions({ priceFormat: { type: 'price', ...getPriceFormat(symbol, latestPrice) } });
   }, [symbol, latestPrice]);
 
   useEffect(() => {
@@ -524,7 +664,6 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
     ma7Ref.current?.setData(showMA ? movingAverage(displayCandles, 7) : []);
     ma25Ref.current?.setData(showMA ? movingAverage(displayCandles, 25) : []);
     ma99Ref.current?.setData(showMA ? movingAverage(displayCandles, 99) : []);
-
     chartRef.current.timeScale().fitContent();
   }, [displayCandles, volumeData, showMA, showVolume]);
 
@@ -547,7 +686,7 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
             <span className={`trend-chip ${summary.tone}`}>{summary.trend}</span>
             <span className="market-score">Score {marketScore}</span>
           </div>
-          <p className="coin-subtitle">Candles com timeframes, volume, médias móveis, zoom, tela cheia e leitura automática.</p>
+          <p className="coin-subtitle">Candles com timeframes, volume, médias móveis, orderbook, trades ao vivo, DOM depth e layout salvo.</p>
         </div>
         <div className="coin-price-block">
           <span className="coin-price">{formatPrice(latestPrice, symbol)}</span>
@@ -571,10 +710,13 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
           onFit={() => chartRef.current?.timeScale().fitContent()}
           onFullscreen={handleFullscreen}
           showMA={showMA}
-          onToggleMA={() => setShowMA((value) => !value)}
+          onToggleMA={toggleMA}
           showVolume={showVolume}
-          onToggleVolume={() => setShowVolume((value) => !value)}
+          onToggleVolume={toggleVolume}
         />
+        <div className="chart-toolbar secondary-toolbar">
+          <button type="button" className={showMicrostructure ? 'active' : ''} onClick={toggleMicrostructure}>Orderbook + DOM</button>
+        </div>
 
         <div className="chart-meta-row">
           <span>{loadingHistory ? 'Carregando candles...' : `${displayCandles.length} candles`}</span>
@@ -596,6 +738,8 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
 
         <div ref={chartContainerRef} className="chart-box trading-chart" />
       </div>
+
+      {showMicrostructure && <OrderbookPanel symbol={symbol} latestPrice={latestPrice} liveTrades={liveTrades} />}
 
       <div className="live-summary-box pro-summary">
         <strong>Leitura ao vivo</strong>
@@ -725,12 +869,16 @@ function AddSymbolPanel({ socket, symbols, onAddSymbol }) {
 }
 
 export default function App() {
-  const [symbols, setSymbols] = useState(DEFAULT_SYMBOLS);
+  const [symbols, setSymbols] = useState(() => readStoredJson('crypto-active-symbols', DEFAULT_SYMBOLS));
   const [prices, setPrices] = useState({});
   const [alerts, setAlerts] = useState([]);
   const [status, setStatus] = useState('Conectando...');
+  const [soundEnabled, setSoundEnabled] = useState(() => readStoredJson('crypto-sound-enabled', true));
   const [candlesBySymbol, setCandlesBySymbol] = useState(() =>
-    Object.fromEntries(DEFAULT_SYMBOLS.map((symbol) => [symbol, []]))
+    Object.fromEntries(readStoredJson('crypto-active-symbols', DEFAULT_SYMBOLS).map((symbol) => [symbol, []]))
+  );
+  const [tradesBySymbol, setTradesBySymbol] = useState(() =>
+    Object.fromEntries(readStoredJson('crypto-active-symbols', DEFAULT_SYMBOLS).map((symbol) => [symbol, []]))
   );
 
   const socket = useMemo(() => io(API_URL, { transports: ['websocket', 'polling'] }), []);
@@ -747,8 +895,17 @@ export default function App() {
     function applySnapshot(payload) {
       const incomingSymbols = Object.keys(payload.symbols || {});
       if (incomingSymbols.length) {
-        setSymbols(incomingSymbols);
+        setSymbols((currentSymbols) => {
+          const stored = currentSymbols.length ? currentSymbols : DEFAULT_SYMBOLS;
+          const merged = [...new Set([...stored, ...incomingSymbols])];
+          writeStoredJson('crypto-active-symbols', merged);
+          return merged;
+        });
         setCandlesBySymbol((current) => ({
+          ...Object.fromEntries(incomingSymbols.map((symbol) => [symbol, current[symbol] || []])),
+          ...current
+        }));
+        setTradesBySymbol((current) => ({
           ...Object.fromEntries(incomingSymbols.map((symbol) => [symbol, current[symbol] || []])),
           ...current
         }));
@@ -797,6 +954,14 @@ export default function App() {
       });
     }
 
+    function handleTradeUpdate(trade) {
+      if (!trade?.symbol) return;
+      setTradesBySymbol((current) => ({
+        ...current,
+        [trade.symbol]: [trade, ...(current[trade.symbol] || [])].slice(0, 80)
+      }));
+    }
+
     function handlePriceAlert(alert) {
       setAlerts((current) => [alert, ...current].slice(0, 8));
 
@@ -805,6 +970,8 @@ export default function App() {
           body: `${alert.direction === 'up' ? 'Alta' : 'Queda'} de ${Math.abs(alert.changePercent).toFixed(3)}%`
         });
       }
+
+      if (!soundEnabled) return;
 
       try {
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -827,6 +994,7 @@ export default function App() {
     socket.on('initial_state', applySnapshot);
     socket.on('symbols_update', applySnapshot);
     socket.on('price_update', handlePriceUpdate);
+    socket.on('trade_update', handleTradeUpdate);
     socket.on('price_alert', handlePriceAlert);
 
     if ('Notification' in window && Notification.permission === 'default') {
@@ -839,14 +1007,20 @@ export default function App() {
       socket.off('initial_state', applySnapshot);
       socket.off('symbols_update', applySnapshot);
       socket.off('price_update', handlePriceUpdate);
+      socket.off('trade_update', handleTradeUpdate);
       socket.off('price_alert', handlePriceAlert);
       socket.disconnect();
     };
-  }, [socket]);
+  }, [socket, soundEnabled]);
 
   function handleAddedSymbol(symbol, snapshot) {
-    setSymbols((current) => (current.includes(symbol) ? current : [...current, symbol]));
+    setSymbols((current) => {
+      const next = current.includes(symbol) ? current : [...current, symbol];
+      writeStoredJson('crypto-active-symbols', next);
+      return next;
+    });
     setCandlesBySymbol((current) => ({ ...current, [symbol]: current[symbol] || [] }));
+    setTradesBySymbol((current) => ({ ...current, [symbol]: current[symbol] || [] }));
 
     if (snapshot?.symbols) {
       const snapshotPrices = Object.fromEntries(
@@ -868,7 +1042,19 @@ export default function App() {
           <h1>Crypto Alerts Pro Terminal</h1>
           <p>Painel profissional em preto com timeframes, volume, médias móveis, busca dinâmica, zoom, tela cheia e leitura automática do mercado.</p>
         </div>
-        <div className="status-chip">{status}</div>
+        <div className="hero-actions">
+          <div className="status-chip">{status}</div>
+          <button
+            type="button"
+            className={`sound-toggle ${soundEnabled ? 'active' : ''}`}
+            onClick={() => {
+              writeStoredJson('crypto-sound-enabled', !soundEnabled);
+              setSoundEnabled((value) => !value);
+            }}
+          >
+            {soundEnabled ? 'Som ligado' : 'Som desligado'}
+          </button>
+        </div>
       </header>
 
       <AlertList alerts={alerts} />
@@ -881,6 +1067,7 @@ export default function App() {
             symbol={symbol}
             latestPrice={prices[symbol]}
             liveCandles={candlesBySymbol[symbol] || []}
+            liveTrades={tradesBySymbol[symbol] || []}
           />
         ))}
       </section>
