@@ -27,6 +27,7 @@ const io = new Server(server, {
 const DEFAULT_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'SPKUSDC'];
 const activeSymbols = new Set(DEFAULT_SYMBOLS);
 const marketState = Object.fromEntries(DEFAULT_SYMBOLS.map((symbol) => [symbol, { price: null, history: [] }]));
+const recentTrades = Object.fromEntries(DEFAULT_SYMBOLS.map((symbol) => [symbol, []]));
 const lastAlertTime = Object.fromEntries(DEFAULT_SYMBOLS.map((symbol) => [symbol, 0]));
 
 let ws;
@@ -40,6 +41,7 @@ function buildStreamUrl() {
 
 function ensureSymbolState(symbol) {
   if (!marketState[symbol]) marketState[symbol] = { price: null, history: [] };
+  if (!recentTrades[symbol]) recentTrades[symbol] = [];
   if (lastAlertTime[symbol] == null) lastAlertTime[symbol] = 0;
 }
 
@@ -133,13 +135,19 @@ function connectBinance() {
       const price = Number(data.p);
       const quantity = Number(data.q || 0);
       const eventTime = Number(data.E || Date.now());
+      const tradeId = Number(data.t || eventTime);
+      const side = data.m ? 'sell' : 'buy';
 
       if (!marketState[symbol] || Number.isNaN(price)) return;
 
       marketState[symbol].price = price;
       pushHistory(symbol, price, eventTime);
 
-      io.emit('price_update', { symbol, price, eventTime, quantity });
+      const trade = { symbol, price, quantity, side, eventTime, tradeId };
+      recentTrades[symbol] = [trade, ...(recentTrades[symbol] || [])].slice(0, 60);
+
+      io.emit('price_update', { symbol, price, eventTime, quantity, side });
+      io.emit('trade_update', trade);
 
       const alert = checkAlert(symbol);
       if (alert) io.emit('price_alert', alert);
@@ -270,6 +278,47 @@ async function addSymbol(input) {
   return { symbol, alreadyExists, snapshot: getSnapshot() };
 }
 
+
+async function getOrderBook(symbol, limit = 50) {
+  const cleanSymbol = cleanSymbolInput(symbol);
+  const cleanLimit = Math.min(Math.max(Number(limit) || 50, 5), 100);
+  const bases = [
+    'https://api.binance.com',
+    'https://api1.binance.com',
+    'https://api2.binance.com',
+    'https://api3.binance.com',
+    'https://api4.binance.com'
+  ];
+
+  let lastError = null;
+
+  for (const base of bases) {
+    try {
+      const url = `${base}/api/v3/depth?symbol=${encodeURIComponent(cleanSymbol)}&limit=${cleanLimit}`;
+      const response = await fetch(url, { headers: { accept: 'application/json' } });
+      if (!response.ok) {
+        lastError = new Error(`Binance respondeu ${response.status} em ${base}`);
+        continue;
+      }
+      const data = await response.json();
+      const mapLevel = ([price, quantity]) => {
+        const p = Number(price);
+        const q = Number(quantity);
+        return { price: p, quantity: q, total: p * q };
+      };
+      return {
+        lastUpdateId: data.lastUpdateId,
+        bids: (data.bids || []).map(mapLevel),
+        asks: (data.asks || []).map(mapLevel)
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw new Error(`Não consegui carregar orderbook de ${cleanSymbol}. ${lastError?.message || ''}`);
+}
+
 app.get('/', (_req, res) => {
   res.json({ ok: true, service: 'crypto-alerts-server' });
 });
@@ -288,6 +337,23 @@ app.get('/klines/:symbol', async (req, res) => {
   } catch (error) {
     res.status(400).json({ ok: false, message: error.message });
   }
+});
+
+
+app.get('/orderbook/:symbol', async (req, res) => {
+  try {
+    const symbol = cleanSymbolInput(req.params.symbol);
+    const limit = req.query.limit || 50;
+    const orderbook = await getOrderBook(symbol, limit);
+    res.json({ ok: true, symbol, orderbook });
+  } catch (error) {
+    res.status(400).json({ ok: false, message: error.message });
+  }
+});
+
+app.get('/trades/:symbol', (req, res) => {
+  const symbol = cleanSymbolInput(req.params.symbol);
+  res.json({ ok: true, symbol, trades: recentTrades[symbol] || [] });
 });
 
 app.post('/symbols', async (req, res) => {
