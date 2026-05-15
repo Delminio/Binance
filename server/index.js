@@ -131,6 +131,7 @@ function connectBinance() {
 
       const symbol = data.s;
       const price = Number(data.p);
+      const quantity = Number(data.q || 0);
       const eventTime = Number(data.E || Date.now());
 
       if (!marketState[symbol] || Number.isNaN(price)) return;
@@ -138,7 +139,7 @@ function connectBinance() {
       marketState[symbol].price = price;
       pushHistory(symbol, price, eventTime);
 
-      io.emit('price_update', { symbol, price, eventTime });
+      io.emit('price_update', { symbol, price, eventTime, quantity });
 
       const alert = checkAlert(symbol);
       if (alert) io.emit('price_alert', alert);
@@ -166,6 +167,54 @@ function connectBinance() {
       // noop
     }
   });
+}
+
+function normalizeKlineInterval(interval) {
+  const cleaned = String(interval || '1s').toLowerCase();
+  const allowed = new Set(['1s', '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']);
+  return allowed.has(cleaned) ? cleaned : '1s';
+}
+
+async function getKlines(symbol, interval = '1s', limit = 240) {
+  const cleanSymbol = cleanSymbolInput(symbol);
+  const cleanInterval = normalizeKlineInterval(interval);
+  const cleanLimit = Math.min(Math.max(Number(limit) || 240, 20), 1000);
+
+  const bases = [
+    'https://api.binance.com',
+    'https://api1.binance.com',
+    'https://api2.binance.com',
+    'https://api3.binance.com',
+    'https://api4.binance.com'
+  ];
+
+  let lastError = null;
+
+  for (const base of bases) {
+    try {
+      const url = `${base}/api/v3/klines?symbol=${encodeURIComponent(cleanSymbol)}&interval=${encodeURIComponent(cleanInterval)}&limit=${cleanLimit}`;
+      const response = await fetch(url, { headers: { accept: 'application/json' } });
+
+      if (!response.ok) {
+        lastError = new Error(`Binance respondeu ${response.status} em ${base}`);
+        continue;
+      }
+
+      const rows = await response.json();
+      return rows.map((row) => ({
+        time: Math.floor(Number(row[0]) / 1000),
+        open: Number(row[1]),
+        high: Number(row[2]),
+        low: Number(row[3]),
+        close: Number(row[4]),
+        volume: Number(row[5] || 0)
+      }));
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw new Error(`Não consegui carregar candles de ${cleanSymbol}. ${lastError?.message || ''}`);
 }
 
 function cleanSymbolInput(input) {
@@ -227,6 +276,18 @@ app.get('/', (_req, res) => {
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, ...getSnapshot() });
+});
+
+app.get('/klines/:symbol', async (req, res) => {
+  try {
+    const symbol = cleanSymbolInput(req.params.symbol);
+    const interval = normalizeKlineInterval(req.query.interval);
+    const limit = req.query.limit || 240;
+    const candles = await getKlines(symbol, interval, limit);
+    res.json({ ok: true, symbol, interval, candles });
+  } catch (error) {
+    res.status(400).json({ ok: false, message: error.message });
+  }
 });
 
 app.post('/symbols', async (req, res) => {
