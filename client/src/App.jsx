@@ -320,15 +320,71 @@ function CoinChartCard({ symbol, latestPrice, liveCandles, onToggleFullscreen })
   useEffect(() => {
     let cancelled = false;
 
+    const normalizeKlines = (rows) => rows.map((row) => {
+      if (Array.isArray(row)) {
+        return {
+          time: Math.floor(Number(row[0]) / 1000),
+          open: Number(row[1]),
+          high: Number(row[2]),
+          low: Number(row[3]),
+          close: Number(row[4]),
+          volume: Number(row[5] || 0)
+        };
+      }
+
+      return {
+        time: Number(row.time),
+        open: Number(row.open),
+        high: Number(row.high),
+        low: Number(row.low),
+        close: Number(row.close),
+        volume: Number(row.volume || 0)
+      };
+    }).filter((item) => (
+      Number.isFinite(item.time) &&
+      Number.isFinite(item.open) &&
+      Number.isFinite(item.high) &&
+      Number.isFinite(item.low) &&
+      Number.isFinite(item.close)
+    ));
+
+    async function fetchFromBackend() {
+      const response = await fetch(`${API_URL}/klines/${symbol}?interval=${timeframe}&limit=300`);
+      const data = await response.json();
+      if (!response.ok || !data?.ok || !Array.isArray(data.candles)) {
+        throw new Error(data?.message || 'Histórico indisponível no backend');
+      }
+      return normalizeKlines(data.candles);
+    }
+
+    async function fetchDirectFromBinance() {
+      const response = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${timeframe}&limit=300`);
+      if (!response.ok) throw new Error('Histórico indisponível na Binance');
+      const rows = await response.json();
+      return normalizeKlines(rows);
+    }
+
     async function loadHistory() {
       setLoadingHistory(true);
+      setHistoricalCandles([]);
+
       try {
-        const response = await fetch(`${API_URL}/klines/${symbol}?interval=${timeframe}&limit=240`);
-        const data = await response.json();
-        if (!cancelled && data?.ok && Array.isArray(data.candles)) {
-          setHistoricalCandles(data.candles);
+        let candles = [];
+
+        if (timeframe !== '1s') {
+          try {
+            candles = await fetchFromBackend();
+          } catch (backendError) {
+            console.warn(`Backend sem histórico para ${symbol} ${timeframe}:`, backendError.message);
+            candles = await fetchDirectFromBinance();
+          }
         }
-      } catch {
+
+        if (!cancelled) {
+          setHistoricalCandles(candles);
+        }
+      } catch (error) {
+        console.warn(`Não foi possível carregar histórico de ${symbol} ${timeframe}:`, error.message);
         if (!cancelled) setHistoricalCandles([]);
       } finally {
         if (!cancelled) setLoadingHistory(false);
